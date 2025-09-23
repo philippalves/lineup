@@ -1,30 +1,33 @@
 export interface Env {
   SOURCE_URL: string;
-  API_KEY?: string; // opcional: se quiser proteger por header x-api-key
+  API_KEY?: string; // opcional: proteger por x-api-key
 }
 
 type Ship = {
   imo?: string | null;
-  ship?: string | null;        // nome do navio (raw[0])
+  ship?: string | null;        // raw[0]
   flag?: string | null;        // raw[1]
-  length_m?: number | null;    // derivado de raw[2]
-  draft_m?: number | null;     // derivado de raw[2]
-  nav?: string | null;         // "Cabo"/"Long" -> raw[3]
-  arrival_text?: string | null;// raw[4] ex: "16/09/2025 00:54:00"
-  arrival_iso?: string | null; // ISO -03:00
-  arrival_ts?: number | null;  // epoch ms (ordenável)
-  notice_code?: string | null; // raw[7] EMB / DESC / EMBDESC
-  notice_en?: string | null;   // Load / Unload / Load & Unload
+  length_m?: number | null;    // de raw[2]
+  draft_m?: number | null;     // de raw[2]
+  nav?: string | null;         // raw[3]
+  arrival_text?: string | null;// raw[4]
+  arrival_iso?: string | null;
+  arrival_ts?: number | null;
+  notice_code?: string | null; // raw[7]
+  notice_en?: string | null;
   agency?: string | null;      // raw[6]
-  operation?: string | null;   // heurística em raw[5] (se não for só número)
+  operation?: string | null;   // heurística em raw[5]
   goods?: string | null;       // raw[8]
   weight?: string | null;      // raw[9]
   voyage?: string | null;      // raw[10]
-  duv?: string | null;         // raw[11] (número)
-  duv_class?: string | null;   // raw[12] ex.: "B"
-  pier?: string | null;        // raw[13] (P: "ALAMOA", "35/37", ...)
-  terminal?: string | null;    // raw[14] (código numérico)
-  raw?: string[];              // linha original
+  duv?: string | null;         // raw[11]
+  duv_class?: string | null;   // raw[12]
+  pier?: string | null;        // raw[13] (P)
+  terminal?: string | null;    // raw[14]
+  // NOVO:
+  cargo_category?: "container" | "liquid" | "bulk" | "other" | null;
+  cargo_category_en?: string | null;
+  raw?: string[];
 };
 
 const ALLOW = ["https://seachiosbrazil.com","https://www.seachiosbrazil.com"];
@@ -52,7 +55,7 @@ function parsePt(
   const d = Number(m.groups.d), mo = Number(m.groups.mo);
   const h = m.groups.h ? Number(m.groups.h) : 0;
   const mi = m.groups.mi ? Number(m.groups.mi) : 0;
-  const utc = Date.UTC(y, mo - 1, d, h, mi, 0) - tzOffsetMin * 60 * 1000; // ts em UTC
+  const utc = Date.UTC(y, mo - 1, d, h, mi, 0) - tzOffsetMin * 60 * 1000;
   const ts = utc;
   const pad = (n: number, w = 2) => String(n).padStart(w, "0");
   const lt = ts + tzOffsetMin * 60 * 1000;
@@ -79,9 +82,52 @@ function parseLenDraft(s?: string | null): { length: number | null; draft: numbe
   const t = s.replace(",", ".").trim();
   let m = t.match(/^\s*(\d{2,4})\s*[\/ ]\s*(\d+(?:\.\d+)?)\s*$/);
   if (m) return { length: Number(m[1]), draft: Number(m[2]) };
-  m = t.match(/^(\d{2,4})(\d+(?:\.\d+)?)$/); // grudado: 18310.5 → 183 / 10.5
+  m = t.match(/^(\d{2,4})(\d+(?:\.\d+)?)$/);
   if (m) return { length: Number(m[1]), draft: Number(m[2]) };
   return { length: null, draft: null };
+}
+
+// --- CATEGORIZAÇÃO DE CARGA ---
+function norm(s: string) {
+  return s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function hasAny(hay: string, needles: string[]) {
+  const H = norm(hay);
+  return needles.some(n => H.includes(n));
+}
+const K_CONTAINER = [
+  "container","conteiner","conteiners","conteineres","contener",
+  "tecon","santos brasil","btp","ecoporto","dp world","terminal de conteiner","terminal de container"
+];
+const K_LIQUID = [
+  "oleo","óleo","combustivel","combustível","diesel","gasolina","etanol","alcool","álcool","nafta","querosene","qsav",
+  "gasoil","gasoleo","gasóleo","bunker","glp","lpg","gnl","lng","metanol","butanol","solvente","acido","ácido",
+  "alamoa"
+];
+const K_BULK = [
+  "granel","grao","graos","grãos","soja","milho","acucar","açucar","açúcar","fertiliz","ureia","ureia","sal",
+  "minerio","minério","carvao","carvão","celulose","trigo","farelo","pellet","potassio","potássio","sulfato",
+  "soda","cimento","clinquer","clínquer","coque","petcoke","mineral","ore","sugar","grain"
+];
+
+function classifyCargo(goods?: string | null, terminal?: string | null, pier?: string | null, agency?: string | null)
+: { cat: "container" | "liquid" | "bulk" | "other", label: string } {
+  const g = goods || "";
+  const t = terminal || "";
+  const p = pier || "";
+  const a = agency || "";
+  const bag = [g,t,p,a].filter(Boolean).join(" | ");
+
+  if (hasAny(bag, K_CONTAINER)) return { cat: "container", label: "Container" };
+  if (hasAny(bag, K_LIQUID))    return { cat: "liquid",    label: "Liquid (Oil)" };
+  if (hasAny(bag, K_BULK))      return { cat: "bulk",      label: "Bulk" };
+  return { cat: "other", label: "Other" };
 }
 
 export default {
@@ -108,7 +154,7 @@ export default {
       });
     }
 
-    // Lê TODAS as linhas de TODAS as tabelas e depois filtramos por "linhas boas"
+    // Captura linhas de tabela
     const rows: string[][] = [];
     let cur: string[] | null = null, col = -1;
 
@@ -121,7 +167,6 @@ export default {
 
     await rw.transform(up).arrayBuffer();
 
-    // Heurística: mantemos só linhas com "muitas" colunas não vazias (>= 12)
     const good = rows.filter(r => r.filter(v => v?.trim()).length >= 12);
 
     const ships: Ship[] = good.map((cells) => {
@@ -130,7 +175,7 @@ export default {
       const lenDraft   = cells[2] ?? "";
       const nav        = cells[3] ?? "";
       const arrival    = cells[4] ?? "";
-      const col5       = cells[5] ?? ""; // pode ser código; só vira "operation" se tiver letras
+      const col5       = cells[5] ?? "";
       const agency     = cells[6] ?? "";
       const notice     = cells[7] ?? "";
       const goods      = cells[8] ?? "";
@@ -147,6 +192,8 @@ export default {
 
       const imoMatch = cells.join(" ").match(/\b\d{7}\b/);
       const imo = imoMatch ? imoMatch[0] : null;
+
+      const cat = classifyCargo(goods, terminal, pier, agency);
 
       return {
         imo,
@@ -169,8 +216,10 @@ export default {
         duv_class: duvClass || null,
         pier: pier || null,
         terminal: terminal || null,
+        cargo_category: cat.cat,
+        cargo_category_en: cat.label,
         raw: cells,
-        // aliases de compatibilidade (remova se não precisar)
+        // aliases (se algum front antigo usar)
         // @ts-ignore
         eta_text: arrival || null,
         // @ts-ignore
