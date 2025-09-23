@@ -1,327 +1,210 @@
-// Worker v3: robust table detection by header, clean mapping, normalization, English labels.
-
 export interface Env {
   SOURCE_URL: string;
   API_KEY?: string;
 }
 
-/** Structured ship row we return */
 type Ship = {
   imo?: string | null;
-  ship?: string | null;
+  ship?: string | null;         // nome do navio
   flag?: string | null;
   length_m?: number | null;
   draft_m?: number | null;
-  nav?: string | null;
-  arrival_text?: string | null;
-  arrival_iso?: string | null;
-  arrival_ts?: number | null;
-  notice_code?: string | null;   // EMB/DESC/EMBDESC
-  notice_en?: string | null;     // Load / Unload / Load & Unload
+  nav?: string | null;          // Cabo / Long
+  arrival_text?: string | null; // "dd/mm/yyyy hh:mm"
+  arrival_iso?: string | null;  // ISO -03:00
+  arrival_ts?: number | null;   // epoch ms (para ordenar)
+  notice_code?: string | null;  // EMB / DESC / EMBDESC
+  notice_en?: string | null;    // Load / Unload / Load & Unload
   agency?: string | null;
-  operation?: string | null;
+  operation?: string | null;    // quando existir texto na coluna 5
   goods?: string | null;
   weight?: string | null;
   voyage?: string | null;
-  duv?: string | null;
-  priority?: string | null;      // "P" column, if present
-  terminal?: string | null;
-  raw?: string[];                // full original cells as fallback
+  duv?: string | null;          // número
+  duv_class?: string | null;    // ex.: B
+  pier?: string | null;         // P (ex.: ALAMOA, 35/37…)
+  terminal?: string | null;     // código numérico do terminal
+  raw?: string[];
 };
 
-type TableBuf = { headers: string[]; rows: string[][] };
-
-const ALLOWED_ORIGINS = [
-  "https://seachiosbrazil.com",
-  "https://www.seachiosbrazil.com",
-];
-
-function corsHeaders(origin: string | null) {
-  const allow =
-    !!origin &&
-    (ALLOWED_ORIGINS.includes(origin) ||
-      ALLOWED_ORIGINS.some((o) => o.startsWith("https://*.") && origin.endsWith(o.slice("https://*".length))));
+// CORS
+const ALLOW = ["https://seachiosbrazil.com","https://www.seachiosbrazil.com"];
+function cors(origin: string | null) {
   return {
-    "Access-Control-Allow-Origin": allow ? origin! : "*",
+    "Access-Control-Allow-Origin": origin && (ALLOW.includes(origin) || origin.endsWith(".framer.app")) ? origin : "*",
     "Access-Control-Allow-Methods": "GET,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, x-api-key",
     "Access-Control-Max-Age": "86400",
   };
 }
 
-const toNumber = (s?: string | null) => {
-  if (!s) return null;
-  const n = s.replace(",", ".").match(/[0-9]+(?:\.[0-9]+)?/)?.[0];
-  return n ? Number(n) : null;
-};
-
-// Parse dates like "23/09 17:40", "23/09/2025 08:00", "23/09"
-function parsePtBrDate(text?: string | null, now: Date = new Date(), tzOffsetMinutes = -180) {
-  if (!text) return { iso: null as string | null, ts: null as number | null };
+// dd/mm[/yyyy] [hh[:mm]]
+function parsePt(
+  text?: string | null,
+  now: Date = new Date(),
+  tzOffsetMin = -180
+): { iso: string | null; ts: number | null } {
+  if (!text) return { iso: null, ts: null };
   const t = text.normalize("NFKC").trim();
   const m = t.match(
-    /(?<d>\d{1,2})[\/\-](?<m>\d{1,2})(?:[\/\-](?<y>\d{2,4}))?(?:\s+(?<hh>\d{1,2})(?::(?<mm>\d{1,2}))?\s*(?:h)?)?/i
+    /(?<d>\d{1,2})\/(?<mo>\d{1,2})(?:\/(?<y>\d{2,4}))?(?:\s+(?<h>\d{1,2})(?::(?<mi>\d{1,2}))?)?/i
   );
-  if (!m || !m.groups) return { iso: null, ts: null };
-  const day = Number(m.groups.d);
-  const mon = Number(m.groups.m);
-  let year = m.groups.y ? Number(m.groups.y) : now.getFullYear();
-  if (year < 100) year += 2000;
-  const hh = m.groups.hh ? Number(m.groups.hh) : 0;
-  const mm = m.groups.mm ? Number(m.groups.mm) : 0;
-  if (mon < 1 || mon > 12 || day < 1 || day > 31 || hh < 0 || hh > 23 || mm < 0 || mm > 59)
-    return { iso: null, ts: null };
-
-  const utc = Date.UTC(year, mon - 1, day, hh, mm, 0) - tzOffsetMinutes * 60 * 1000;
+  if (!m?.groups) return { iso: null, ts: null };
+  let y = m.groups.y ? Number(m.groups.y) : now.getFullYear();
+  if (y < 100) y += 2000;
+  const d = Number(m.groups.d), mo = Number(m.groups.mo);
+  const h = m.groups.h ? Number(m.groups.h) : 0;
+  const mi = m.groups.mi ? Number(m.groups.mi) : 0;
+  const utc = Date.UTC(y, mo - 1, d, h, mi, 0) - tzOffsetMin * 60 * 1000;
   const ts = utc;
-
   const pad = (n: number, w = 2) => String(n).padStart(w, "0");
-  const localTs = ts + tzOffsetMinutes * 60 * 1000;
-  const dLoc = new Date(localTs);
-  const isoLocal =
-    `${pad(dLoc.getUTCFullYear(), 4)}-${pad(dLoc.getUTCMonth() + 1)}-${pad(dLoc.getUTCDate())}` +
-    `T${pad(dLoc.getUTCHours())}:${pad(dLoc.getUTCMinutes())}:${pad(dLoc.getUTCSeconds())}-` +
-    `${pad(Math.abs(tzOffsetMinutes) / 60)}:${pad(Math.abs(tzOffsetMinutes) % 60)}`;
-  return { iso: isoLocal, ts };
+  const lt = ts + tzOffsetMin * 60 * 1000;
+  const dloc = new Date(lt);
+  const iso =
+    `${pad(dloc.getUTCFullYear(),4)}-${pad(dloc.getUTCMonth()+1)}-${pad(dloc.getUTCDate())}` +
+    `T${pad(dloc.getUTCHours())}:${pad(dloc.getUTCMinutes())}:${pad(dloc.getUTCSeconds())}-` +
+    `${pad(Math.abs(tzOffsetMin)/60)}:${pad(Math.abs(tzOffsetMin)%60)}`;
+  return { iso, ts };
 }
 
-function norm(s: string) {
-  return s
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[^\w\/ ]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Map header text → semantic key
-function headerKey(h: string): string | null {
-  const n = norm(h);
-  const map: Array<[string, string[]]> = [
-    ["imo", ["imo"]],
-    ["ship", ["navio ship", "navio", "ship"]],
-    ["flag", ["bandeira flag", "bandeira", "flag"]],
-    ["lengthdraft", ["com len cal draft", "length draft", "comprimento calado", "len draft"]],
-    ["nav", ["nav"]],
-    ["arrival", ["cheg arrival d m y", "chegada", "arrival"]],
-    ["notice", ["carimbo notice", "notice", "carimbo"]],
-    ["agency", ["agencia office", "agencia", "office", "agency"]],
-    ["operation", ["operac operat", "operacao", "operation", "operat"]],
-    ["goods", ["mercadoria goods", "mercadoria", "goods"]],
-    ["weight", ["peso weight", "peso", "weight"]],
-    ["voyage", ["viagem voyage", "viagem", "voyage"]],
-    ["duv", ["duv"]],
-    ["priority", ["p", "prioridade"]],
-    ["terminal", ["terminal"]],
-  ];
-  for (const [key, needles] of map) {
-    if (needles.some((s) => n.includes(s))) return key;
-  }
-  return null;
-}
-
-function translateNotice(code?: string | null): string | null {
+function translateNotice(code?: string | null) {
   if (!code) return null;
   const t = code.toUpperCase();
+  if (t.includes("EMB") && t.includes("DESC")) return "Load & Unload";
   if (t === "EMB") return "Load";
   if (t === "DESC") return "Unload";
-  if (t === "EMBDESC" || t === "EMB/DESC" || (t.includes("EMB") && t.includes("DESC"))) return "Load & Unload";
   return code;
+}
+
+// tenta decodificar "Length/Draft"
+// formatos esperados: "183 10.5" | "183/10.5" | "18310.5"
+function parseLenDraft(s?: string | null): { length: number | null; draft: number | null } {
+  if (!s) return { length: null, draft: null };
+  const t = s.replace(",", ".").trim();
+  let m = t.match(/^\s*(\d{2,4})\s*[\/ ]\s*(\d+(?:\.\d+)?)\s*$/);
+  if (m) return { length: Number(m[1]), draft: Number(m[2]) };
+  m = t.match(/^(\d{2,4})(\d+(?:\.\d+)?)$/); // grudado: 18310.5 → 183 / 10.5
+  if (m) return { length: Number(m[1]), draft: Number(m[2]) };
+  return { length: null, draft: null };
 }
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = req.headers.get("Origin");
-    if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(origin) });
+    if (req.method === "OPTIONS") return new Response(null, { headers: cors(origin) });
 
-    if (env.API_KEY) {
-      if (req.headers.get("x-api-key") !== env.API_KEY) {
-        return new Response(JSON.stringify({ error: "unauthorized" }), {
-          status: 401,
-          headers: { "content-type": "application/json", ...corsHeaders(origin) },
-        });
-      }
+    if (env.API_KEY && req.headers.get("x-api-key") !== env.API_KEY) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401, headers: { "content-type": "application/json", ...cors(origin) }
+      });
     }
 
-    // CDN cache
+    // cache
     const cache = caches.default;
-    const cacheKey = new Request(new URL(req.url).toString(), req);
-    const cached = await cache.match(cacheKey);
-    if (cached) return new Response(cached.body, cached);
+    const key = new Request(new URL(req.url).toString(), req);
+    const hit = await cache.match(key);
+    if (hit) return new Response(hit.body, hit);
 
-    // Fetch upstream
-    const upstream = await fetch(env.SOURCE_URL, {
-      headers: { "user-agent": "Mozilla/5.0 (header-aware fetch)" },
-    });
-    if (!upstream.ok) {
-      return new Response(JSON.stringify({ error: `upstream ${upstream.status}` }), {
-        status: 502,
-        headers: { "content-type": "application/json", ...corsHeaders(origin) },
+    const up = await fetch(env.SOURCE_URL, { headers: { "user-agent": "Mozilla/5.0 (worker)" } });
+    if (!up.ok) {
+      return new Response(JSON.stringify({ error: `upstream ${up.status}` }), {
+        status: 502, headers: { "content-type": "application/json", ...cors(origin) }
       });
     }
 
-    // Parse ALL tables; choose the best one by headers/width
-    const tables: TableBuf[] = [];
-    let current: TableBuf | null = null;
-    let colIndex = -1;
+    // Captura a TABELA PRINCIPAL (tbody tds) como linhas cruas
+    const rows: string[][] = [];
+    let cur: string[] | null = null, col = -1;
 
-    const rewriter = new HTMLRewriter()
-      .on("table", {
-        element() {
-          current = { headers: [], rows: [] };
-          tables.push(current);
-        },
-      })
-      .on("table thead tr th", {
-        element() {
-          if (!current) return;
-          current.headers.push("");
-        },
-        text(t) {
-          if (!current) return;
-          const i = current.headers.length - 1;
-          current.headers[i] = (current.headers[i] + " " + t.text).trim();
-        },
-      })
-      .on("table tbody tr", {
-        element() {
-          if (!current) return;
-          current.rows.push([]);
-          colIndex = -1;
-        },
-      })
+    const rw = new HTMLRewriter()
+      .on("table tbody tr", { element() { cur = []; rows.push(cur!); col = -1; } })
       .on("table tbody tr td", {
-        element() {
-          if (!current) return;
-          colIndex++;
-          const row = current.rows[current.rows.length - 1];
-          row[colIndex] = "";
-        },
-        text(t) {
-          if (!current) return;
-          const row = current.rows[current.rows.length - 1];
-          row[colIndex] = (row[colIndex] + " " + t.text).trim();
-        },
+        element() { if (!cur) return; col++; cur[col] = ""; },
+        text(t) { if (!cur) return; cur[col] = (cur[col] + " " + t.text).trim(); }
       });
 
-    await rewriter.transform(upstream).arrayBuffer();
+    await rw.transform(up).arrayBuffer();
 
-    // Score and pick table
-    function scoreTable(tb: TableBuf) {
-      const keys = tb.headers.map((h) => headerKey(h));
-      const hit = keys.filter(Boolean).length;
-      return { keys, hit, cols: Math.max(tb.headers.length, tb.rows[0]?.length || 0) };
-    }
+    // Heurística: consideramos “linha válida” se tiver pelo menos 12-13 colunas
+    const good = rows.filter(r => r.filter(v => v?.trim()).length >= 12);
 
-    let pickIdx = -1;
-    let best = { hit: -1, cols: -1, keys: [] as (string | null)[] };
-    for (let i = 0; i < tables.length; i++) {
-      const s = scoreTable(tables[i]);
-      // Prefer more recognized headers; tie-breaker: more columns
-      if (s.hit > best.hit || (s.hit === best.hit && s.cols > best.cols)) {
-        best = s;
-        pickIdx = i;
-      }
-    }
-    if (pickIdx === -1) {
-      // fallback: largest table by columns
-      pickIdx =
-        tables
-          .map((t, i) => ({ i, cols: Math.max(t.headers.length, t.rows[0]?.length || 0) }))
-          .sort((a, b) => b.cols - a.cols)[0]?.i ?? 0;
-      best = scoreTable(tables[pickIdx]);
-    }
+    const ships: Ship[] = good.map((cells) => {
+      // índice fixo baseado no seu exemplo de raw[]
+      const shipName   = cells[0] ?? "";
+      const flag       = cells[1] ?? "";
+      const lenDraft   = cells[2] ?? "";
+      const nav        = cells[3] ?? "";
+      const arrival    = cells[4] ?? "";
+      const col5       = cells[5] ?? ""; // às vezes vem algo; se for texto "grande", tratamos como operação
+      const agency     = cells[6] ?? "";
+      const notice     = cells[7] ?? "";
+      const goods      = cells[8] ?? "";
+      const weight     = cells[9] ?? "";
+      const voyage     = cells[10] ?? "";
+      const duvNum     = cells[11] ?? "";
+      const duvClass   = cells[12] ?? "";
+      const pier       = cells[13] ?? "";
+      const terminal   = cells[14] ?? "";
 
-    const tb = tables[pickIdx] || { headers: [], rows: [] };
-    const keys = best.keys.length ? best.keys : tb.headers.map(() => null);
+      const { length, draft } = parseLenDraft(lenDraft);
+      const { iso, ts } = parsePt(arrival);
 
-    // Map each row to Ship
-    const ships: Ship[] = tb.rows
-      .filter((r) => r.length > 1)
-      .map((cells) => {
-        const get = (wanted: string) => {
-          const idx = keys.findIndex((k) => k === wanted);
-          return idx >= 0 ? (cells[idx] ?? "") : "";
-        };
+      // Operation: só aceita se não for apenas números/hífens
+      const operation = /[A-Za-z]/.test(col5) && !/^\d[\d\- ]*$/.test(col5) ? col5 : null;
 
-        const lengthdraft = get("lengthdraft");
-        let length_m: number | null = null;
-        let draft_m: number | null = null;
-        if (lengthdraft) {
-          const m = lengthdraft.replace(",", ".").match(/^\s*([0-9]+(?:\.[0-9]+)?)?\s*\/\s*([0-9]+(?:\.[0-9]+)?)?\s*$/);
-          if (m) {
-            length_m = m[1] ? Number(m[1]) : null;
-            draft_m = m[2] ? Number(m[2]) : null;
-          }
-        }
+      // IMO: procura qualquer 7 dígitos na linha
+      const imoMatch = cells.join(" ").match(/\b\d{7}\b/);
+      const imo = imoMatch ? imoMatch[0] : null;
 
-        const arrival_text = get("arrival") || null;
-        const { iso: arrival_iso, ts: arrival_ts } = parsePtBrDate(arrival_text);
+      return {
+        imo,
+        ship: shipName || null,
+        flag: flag || null,
+        length_m: length,
+        draft_m: draft,
+        nav: nav || null,
+        arrival_text: arrival || null,
+        arrival_iso: iso,
+        arrival_ts: ts,
+        notice_code: notice || null,
+        notice_en: translateNotice(notice),
+        agency: agency || null,
+        operation,
+        goods: goods || null,
+        weight: weight || null,
+        voyage: voyage || null,
+        duv: duvNum || null,
+        duv_class: duvClass || null,
+        pier: pier || null,
+        terminal: terminal || null,
+        raw: cells,
+        // alias para retrocompatibilidade (se algum front esperar eta_*)
+        // remove se não precisar:
+        // @ts-ignore
+        eta_text: arrival || null,
+        // @ts-ignore
+        eta_iso: iso,
+        // @ts-ignore
+        eta_ts: ts,
+      };
+    });
 
-        const notice_code = get("notice") || null;
-        const notice_en = translateNotice(notice_code);
-
-        // IMO: try column; if not present, scan any 7-digit
-        let imo: string | null = null;
-        const colImo = get("imo");
-        if (colImo) {
-          const m = colImo.match(/\b\d{7}\b/);
-          if (m) imo = m[0];
-        } else {
-          for (const v of cells) {
-            const m = v.match(/\b\d{7}\b/);
-            if (m) {
-              imo = m[0];
-              break;
-            }
-          }
-        }
-
-        return {
-          imo,
-          ship: get("ship") || null,
-          flag: get("flag") || null,
-          length_m,
-          draft_m,
-          nav: get("nav") || null,
-          arrival_text,
-          arrival_iso,
-          arrival_ts,
-          notice_code,
-          notice_en,
-          agency: get("agency") || null,
-          operation: get("operation") || null,
-          goods: get("goods") || null,
-          weight: get("weight") || null,
-          voyage: get("voyage") || null,
-          duv: get("duv") || null,
-          priority: get("priority") || null,
-          terminal: get("terminal") || null,
-          raw: cells,
-        };
-      });
-
-    // Sort by arrival time (unknowns last)
-    ships.sort((a, b) => (a.arrival_ts ?? Number.POSITIVE_INFINITY) - (b.arrival_ts ?? Number.POSITIVE_INFINITY));
-
-    const payload = JSON.stringify({
+    const body = JSON.stringify({
       source: env.SOURCE_URL,
       updatedAt: new Date().toISOString(),
       count: ships.length,
       ships,
-      headersDetected: tb.headers,
-      keysDetected: keys,
-      pickedTableIndex: pickIdx,
     });
 
-    const resp = new Response(payload, {
+    const resp = new Response(body, {
       headers: {
         "content-type": "application/json; charset=utf-8",
         "cache-control": "public, s-maxage=600, stale-while-revalidate=3600",
-        ...corsHeaders(origin),
+        ...cors(origin),
       },
     });
-    ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+    ctx.waitUntil(cache.put(key, resp.clone()));
     return resp;
   },
 };
+
