@@ -1,7 +1,8 @@
 import * as React from "react";
 import { addPropertyControls, ControlType } from "framer";
 
-/** Must match the Worker (src/worker.ts) */
+type Category = "container" | "liquid" | "bulk" | "other";
+
 type Ship = {
   imo?: string | null;
   ship?: string | null;
@@ -23,6 +24,8 @@ type Ship = {
   duv_class?: string | null;
   pier?: string | null;
   terminal?: string | null;
+  cargo_category?: Category | null;
+  cargo_category_en?: string | null;
   raw?: string[];
 };
 
@@ -39,15 +42,17 @@ type Props = {
   refreshMs: number;
   maxRows: number;
   filterText: string;
+  filterCategory: "all" | "container" | "liquid" | "bulk";
+
   sortBy: "arrival" | "ship" | "terminal";
   sortDir: "asc" | "desc";
 
-  columnOrder: string; // e.g. "imo,ship,flag,lengthDraft,nav,arrival,notice,agency,operation,goods,weight,voyage,duv,duvClass,pier,terminal"
-  showIMO: boolean; showShip: boolean; showFlag: boolean; showLengthDraft: boolean; showNav: boolean;
+  columnOrder: string; // e.g. "category,imo,ship,flag,lengthDraft,nav,arrival,notice,agency,operation,goods,weight,voyage,duv,duvClass,pier,terminal"
+  showCategory: boolean; showIMO: boolean; showShip: boolean; showFlag: boolean; showLengthDraft: boolean; showNav: boolean;
   showArrival: boolean; showNotice: boolean; showAgency: boolean; showOperation: boolean;
   showGoods: boolean; showWeight: boolean; showVoyage: boolean; showDUV: boolean; showDUVClass: boolean; showPier: boolean; showTerminal: boolean;
 
-  lblIMO: string; lblShip: string; lblFlag: string; lblLengthDraft: string; lblNav: string;
+  lblCategory: string; lblIMO: string; lblShip: string; lblFlag: string; lblLengthDraft: string; lblNav: string;
   lblArrival: string; lblNotice: string; lblAgency: string; lblOperation: string; lblGoods: string; lblWeight: string; lblVoyage: string; lblDUV: string; lblDUVClass: string; lblPier: string; lblTerminal: string;
 
   fontSize: number; rowHeight: number; cellPaddingX: number; cellPaddingY: number;
@@ -60,15 +65,17 @@ export default function PortoSantosExpectedCargo(p: Partial<Props>) {
   const {
     apiUrl = "https://porto-santos-lineup.filippe.workers.dev/",
     apiKey, refreshMs = 60_000, maxRows = 500, filterText = "",
+    filterCategory = "all",
+
     sortBy = "arrival", sortDir = "asc",
 
-    columnOrder = "imo,ship,flag,lengthDraft,nav,arrival,notice,agency,operation,goods,weight,voyage,duv,duvClass,pier,terminal",
+    columnOrder = "category,imo,ship,flag,lengthDraft,nav,arrival,notice,agency,operation,goods,weight,voyage,duv,duvClass,pier,terminal",
 
-    showIMO = true, showShip = true, showFlag = true, showLengthDraft = true, showNav = true,
+    showCategory = true, showIMO = true, showShip = true, showFlag = true, showLengthDraft = true, showNav = true,
     showArrival = true, showNotice = true, showAgency = true, showOperation = true,
     showGoods = true, showWeight = true, showVoyage = true, showDUV = true, showDUVClass = false, showPier = true, showTerminal = true,
 
-    lblIMO = "IMO", lblShip = "Ship", lblFlag = "Flag", lblLengthDraft = "Length/Draft (m)", lblNav = "Nav",
+    lblCategory = "Category", lblIMO = "IMO", lblShip = "Ship", lblFlag = "Flag", lblLengthDraft = "Length/Draft (m)", lblNav = "Nav",
     lblArrival = "Arrival (d/m/y)", lblNotice = "Notice", lblAgency = "Agency", lblOperation = "Operation",
     lblGoods = "Goods", lblWeight = "Weight", lblVoyage = "Voyage", lblDUV = "DUV", lblDUVClass = "DUV Class", lblPier = "P", lblTerminal = "Terminal",
 
@@ -114,16 +121,20 @@ export default function PortoSantosExpectedCargo(p: Partial<Props>) {
       ? new Date(s.arrival_iso).toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
       : value(s.arrival_text);
 
-  // Filter
+  // Filter (text + category)
   const q = (filterText || "").toLowerCase();
-  let rows = (data.ships || []).filter((s) =>
-    !q
+  let rows = (data.ships || []).filter((s) => {
+    const passText = !q
       ? true
       : (s.ship || "").toLowerCase().includes(q) ||
         (s.goods || "").toLowerCase().includes(q) ||
         (s.terminal || "").toLowerCase().includes(q) ||
-        (s.agency || "").toLowerCase().includes(q)
-  );
+        (s.agency || "").toLowerCase().includes(q);
+    const passCat =
+      filterCategory === "all" ? true :
+      s.cargo_category === filterCategory;
+    return passText && passCat;
+  });
 
   // Sort
   rows = rows.sort((a, b) => {
@@ -142,11 +153,29 @@ export default function PortoSantosExpectedCargo(p: Partial<Props>) {
 
   if (maxRows > 0) rows = rows.slice(0, maxRows);
 
+  // Badge para Category
+  const catBadge: React.CSSProperties = {
+    display: "inline-block",
+    padding: "2px 8px",
+    borderRadius: 999,
+    fontSize: Math.max(10, fontSize - 2),
+    lineHeight: 1.4,
+    border: "1px solid rgba(0,0,0,0.08)",
+  };
+  const catStyle = (c?: Category | null): React.CSSProperties => {
+    const base = { ...catBadge };
+    if (c === "container") return { ...base, background: "#f0f7ff" };
+    if (c === "liquid")    return { ...base, background: "#fff6f0" };
+    if (c === "bulk")      return { ...base, background: "#f6fff0" };
+    return { ...base, background: "#f2f2f2" };
+  };
+
   // Columns
   type Col = { key: string; label: string; show: boolean; render: (s: Ship) => React.ReactNode };
   const col = (key: string, label: string, show: boolean, render: (s: Ship) => React.ReactNode): Col => ({ key, label, show, render });
 
   const all: Record<string, Col> = {
+    category:    col("category", lblCategory, showCategory, (s) => <span style={catStyle(s.cargo_category)}>{s.cargo_category_en ?? "Other"}</span>),
     imo:         col("imo", lblIMO, showIMO, (s) => value(s.imo)),
     ship:        col("ship", lblShip, showShip, (s) => value(s.ship)),
     flag:        col("flag", lblFlag, showFlag, (s) => value(s.flag)),
@@ -223,11 +252,14 @@ addPropertyControls(PortoSantosExpectedCargo, {
   refreshMs: { type: ControlType.Number, title: "Refresh (ms)", min: 0, max: 3_600_000, defaultValue: 60_000 },
   maxRows: { type: ControlType.Number, title: "Max rows", min: 0, max: 5000, defaultValue: 500 },
   filterText: { type: ControlType.String, title: "Filter (text)" },
+  filterCategory: { type: ControlType.Enum, title: "Filter: Category", options: ["all","container","liquid","bulk"], optionTitles: ["All","Container","Liquid","Bulk"], defaultValue: "all" },
+
   sortBy: { type: ControlType.Enum, title: "Sort by", options: ["arrival", "ship", "terminal"], optionTitles: ["Arrival", "Ship", "Terminal"], defaultValue: "arrival" },
   sortDir: { type: ControlType.Enum, title: "Sort dir", options: ["asc", "desc"], optionTitles: ["Asc", "Desc"], defaultValue: "asc" },
 
-  columnOrder: { type: ControlType.String, title: "Column order", defaultValue: "imo,ship,flag,lengthDraft,nav,arrival,notice,agency,operation,goods,weight,voyage,duv,duvClass,pier,terminal", displayTextArea: true },
+  columnOrder: { type: ControlType.String, title: "Column order", defaultValue: "category,imo,ship,flag,lengthDraft,nav,arrival,notice,agency,operation,goods,weight,voyage,duv,duvClass,pier,terminal", displayTextArea: true },
 
+  showCategory: { type: ControlType.Boolean, title: "Show Category", defaultValue: true },
   showIMO: { type: ControlType.Boolean, title: "Show IMO", defaultValue: true },
   showShip: { type: ControlType.Boolean, title: "Show Ship", defaultValue: true },
   showFlag: { type: ControlType.Boolean, title: "Show Flag", defaultValue: true },
@@ -245,6 +277,7 @@ addPropertyControls(PortoSantosExpectedCargo, {
   showPier: { type: ControlType.Boolean, title: "Show P", defaultValue: true },
   showTerminal: { type: ControlType.Boolean, title: "Show Terminal", defaultValue: true },
 
+  lblCategory: { type: ControlType.String, title: "Label: Category", defaultValue: "Category" },
   lblIMO: { type: ControlType.String, title: "Label: IMO", defaultValue: "IMO" },
   lblShip: { type: ControlType.String, title: "Label: Ship", defaultValue: "Ship" },
   lblFlag: { type: ControlType.String, title: "Label: Flag", defaultValue: "Flag" },
