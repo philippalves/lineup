@@ -1,36 +1,40 @@
-// Cloudflare Worker: Porto de Santos "Navios Esperados – Carga"
-// - Busca o HTML da página oficial
-// - Extrai a tabela em streaming (HTMLRewriter)
-// - Normaliza ETA -> ISO (timezone America/Sao_Paulo)
-// - Ordena por ETA real no backend
-// - Expõe JSON com cache + CORS
+// Worker v2: header-aware parser + normalization + English operation names
 
 export interface Env {
-  SOURCE_URL: string; // defina no wrangler.toml ou nas Vars do Worker
-  API_KEY?: string;   // opcional (se quiser proteger por header x-api-key)
+  SOURCE_URL: string;
+  API_KEY?: string;
 }
 
+type Row = Record<string, string>;
+
 type Ship = {
-  eta_text?: string;        // texto cru da célula ETA
-  eta_iso?: string | null;  // ISO-8601 (ex.: 2025-03-14T09:30:00-03:00)
-  eta_ts?: number | null;   // timestamp ms (Date.getTime)
-  ship?: string;
-  imo?: string;
+  imo?: string | null;
+  ship?: string | null;
+  flag?: string | null;
   length_m?: number | null;
   draft_m?: number | null;
   nav?: string | null;
-  cargo?: string | null;
-  terminal?: string | null;
+  arrival_text?: string | null;
+  arrival_iso?: string | null;
+  arrival_ts?: number | null;
+  notice_code?: string | null;   // EMB / DESC / EMBDESC
+  notice_en?: string | null;     // Load / Unload / Load & Unload
+  agency?: string | null;
+  operation?: string | null;
+  goods?: string | null;
+  weight?: string | null;
+  voyage?: string | null;
+  duv?: string | null;
   priority?: string | null;
-  raw?: string[];           // linha completa (fallback)
+  terminal?: string | null;
+  raw?: string[];
 };
 
-// Domínios que poderão consumir a API (ajuste para o seu site)
+// ---- CORS ----
 const ALLOWED_ORIGINS = [
   "https://seachiosbrazil.com",
   "https://www.seachiosbrazil.com",
 ];
-
 function corsHeaders(origin: string | null) {
   const allow =
     !!origin &&
@@ -44,54 +48,39 @@ function corsHeaders(origin: string | null) {
   };
 }
 
-// ---- Util: parsing tolerante de números (comprimento/calado) ----
-const toNumber = (s?: string) => {
-  const n = s?.replace(",", ".").match(/[0-9]+(\.[0-9]+)?/)?.[0];
+// ---- Utils ----
+const toNumber = (s?: string | null) => {
+  if (!s) return null;
+  const n = s.replace(",", ".").match(/[0-9]+(\.[0-9]+)?/)?.[0];
   return n ? Number(n) : null;
 };
 
-// ---- Util: parsing de datas em PT-BR ----
-// Aceita formatos comuns no site, ex.: "14/03/2025 09:30", "14/03 09:30", "14/03", "14/03 9h", etc.
+// Arrival PT-BR → ISO(-03:00)
 function parsePtBrDate(
-  text?: string,
+  text?: string | null,
   now: Date = new Date(),
-  tzOffsetMinutes: number = -180 // America/Sao_Paulo (UTC-3) — ajuste se necessário (horário de verão não vigente)
+  tzOffsetMinutes: number = -180
 ): { iso: string | null; ts: number | null } {
   if (!text) return { iso: null, ts: null };
-
   const t = text.normalize("NFKC").trim();
-
-  // dd/mm[/yyyy] [hh[:mm] [h]]
-  // Ex.: 07/09/2025 08:45 | 07/09 8h | 07/09
   const m = t.match(
     /(?<d>\d{1,2})[\/\-](?<m>\d{1,2})(?:[\/\-](?<y>\d{2,4}))?(?:\s+(?<hh>\d{1,2})(?::(?<mm>\d{1,2}))?\s*(?:h)?)?/i
   );
   if (!m || !m.groups) return { iso: null, ts: null };
-
   const day = Number(m.groups.d);
-  const month = Number(m.groups.m);
+  const mon = Number(m.groups.m);
   let year = m.groups.y ? Number(m.groups.y) : now.getFullYear();
   if (year < 100) year += 2000;
-
   let hh = m.groups.hh ? Number(m.groups.hh) : 0;
   let mm = m.groups.mm ? Number(m.groups.mm) : 0;
-
-  // Validações básicas
-  if (month < 1 || month > 12 || day < 1 || day > 31 || hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+  if (mon < 1 || mon > 12 || day < 1 || day > 31 || hh < 0 || hh > 23 || mm < 0 || mm > 59)
     return { iso: null, ts: null };
-  }
 
-  // Monta data em UTC a partir do "local" -03:00
-  // Estratégia: cria a data como se fosse no fuso local alvo e converte para UTC.
-  const utcTs =
-    Date.UTC(year, month - 1, day, hh, mm, 0) + tzOffsetMinutes * 60 * 1000 * -1; // remove o offset para virar UTC
-  const ts = utcTs; // já é ms epoch UTC
-  const iso = new Date(ts).toISOString(); // ISO UTC
+  const utc = Date.UTC(year, mon - 1, day, hh, mm, 0) - tzOffsetMinutes * 60 * 1000;
+  const ts = utc;
 
-  // Mas para conveniência do cliente, queremos ISO com offset -03:00.
-  // Converte para string com offset.
   const pad = (n: number, s = 2) => String(n).padStart(s, "0");
-  const localTs = ts + tzOffsetMinutes * 60 * 1000; // aplica -03:00
+  const localTs = ts + tzOffsetMinutes * 60 * 1000;
   const dLoc = new Date(localTs);
   const isoLocal =
     `${pad(dLoc.getUTCFullYear(), 4)}-${pad(dLoc.getUTCMonth() + 1)}-${pad(dLoc.getUTCDate())}` +
@@ -101,20 +90,59 @@ function parsePtBrDate(
   return { iso: isoLocal, ts };
 }
 
-// ---- Worker principal ----
+// normalize header text → key
+function norm(s: string) {
+  return s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^\w\/ ]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function headerKey(h: string): string | null {
+  const n = norm(h);
+  const map: Array<[string, string[]]> = [
+    ["ship", ["navio ship", "navio", "ship"]],
+    ["flag", ["bandeira flag", "bandeira", "flag"]],
+    ["lengthdraft", ["com len cal draft", "comprimento calado", "length draft", "len draft"]],
+    ["nav", ["nav"]],
+    ["arrival", ["cheg arrival d m y", "chegada", "arrival"]],
+    ["notice", ["carimbo notice", "notice", "carimbo"]],
+    ["agency", ["agencia office", "agencia", "office", "agency"]],
+    ["operation", ["operac operat", "operacao", "operat", "operation"]],
+    ["goods", ["mercadoria goods", "mercadoria", "goods"]],
+    ["weight", ["peso weight", "peso", "weight"]],
+    ["voyage", ["viagem voyage", "viagem", "voyage"]],
+    ["duv", ["duv"]],
+    ["priority", ["p", "prioridade"]],
+    ["terminal", ["terminal"]],
+    ["imo", ["imo"]],
+  ];
+  for (const [key, needles] of map) {
+    if (needles.some((n2) => n.includes(n2))) return key;
+  }
+  return null;
+}
+
+function translateNotice(code?: string | null): string | null {
+  if (!code) return null;
+  const t = code.toUpperCase();
+  if (t === "EMB") return "Load";
+  if (t === "DESC") return "Unload";
+  if (t === "EMBDESC" || t === "EMB/DESC" || t.includes("EMB") && t.includes("DESC")) return "Load & Unload";
+  return code;
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const { method, headers } = req;
-    const origin = headers.get("Origin");
-
-    if (method === "OPTIONS") {
+    const origin = req.headers.get("Origin");
+    if (req.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders(origin) });
     }
 
-    // (Opcional) proteção por header
     if (env.API_KEY) {
-      const key = headers.get("x-api-key");
-      if (key !== env.API_KEY) {
+      const k = req.headers.get("x-api-key");
+      if (k !== env.API_KEY) {
         return new Response(JSON.stringify({ error: "unauthorized" }), {
           status: 401,
           headers: { "content-type": "application/json", ...corsHeaders(origin) },
@@ -122,15 +150,13 @@ export default {
       }
     }
 
-    // Cache CDN (10 min)
     const cache = caches.default;
     const cacheKey = new Request(new URL(req.url).toString(), req);
-    const cached = await cache.match(cacheKey);
-    if (cached) return new Response(cached.body, cached);
+    const hit = await cache.match(cacheKey);
+    if (hit) return new Response(hit.body, hit);
 
-    // Busca upstream
     const upstream = await fetch(env.SOURCE_URL, {
-      headers: { "user-agent": "Mozilla/5.0 (data-fetch for internal dashboard)" },
+      headers: { "user-agent": "Mozilla/5.0 (header-aware fetch)" },
     });
     if (!upstream.ok) {
       return new Response(JSON.stringify({ error: `upstream ${upstream.status}` }), {
@@ -139,12 +165,22 @@ export default {
       });
     }
 
-    // Extrai linhas da primeira tabela do conteúdo
+    // collect headers + rows
+    const headersList: string[] = [];
     const rows: string[][] = [];
     let currentRow: string[] | null = null;
     let colIndex = -1;
 
     const rewriter = new HTMLRewriter()
+      .on("table thead tr th", {
+        element() {
+          headersList.push("");
+        },
+        text(t) {
+          const i = headersList.length - 1;
+          headersList[i] = (headersList[i] + " " + t.text).trim();
+        },
+      })
       .on("table tbody tr", {
         element() {
           currentRow = [];
@@ -160,59 +196,93 @@ export default {
         },
         text(t) {
           if (!currentRow) return;
-          currentRow[colIndex] += t.text.trim();
+          currentRow[colIndex] = (currentRow[colIndex] + " " + t.text).trim();
         },
       });
 
     await rewriter.transform(upstream).arrayBuffer();
 
-    // Mapeamento heurístico das colunas -> campos
-    // Ajuste os índices conforme a página (mantemos raw para fallback)
+    // Build column map by header labels
+    const keys = headersList.map((h) => headerKey(h) || `col_${norm(h)}`);
+    // Fallback: if page has no thead, assume first row is header (rare). We already captured thead; skip.
+
     const ships: Ship[] = rows
       .filter((r) => r.length > 1)
-      .map((tds) => {
-        const [etaCell, ship, imoMaybe, lengthMaybe, draftMaybe, navMaybe, cargoMaybe, priorityMaybe, terminalMaybe] = [
-          tds[0],
-          tds[1],
-          tds[2],
-          tds[3],
-          tds[4],
-          tds[5],
-          tds[6],
-          tds[7],
-          tds[8],
-        ];
+      .map((cells) => {
+        const row: Row = {};
+        cells.forEach((val, i) => (row[keys[i] || `c${i}`] = val.trim()));
 
-        const { iso, ts } = parsePtBrDate(etaCell);
+        // Parse length/draft if present
+        let length_m: number | null = null;
+        let draft_m: number | null = null;
+        const ld = (row["lengthdraft"] as string) || "";
+        if (ld) {
+          // formats: "200/12", "-/16"
+          const m = ld.replace(",", ".").match(/^\s*([0-9]+(?:\.[0-9]+)?)?\s*\/\s*([0-9]+(?:\.[0-9]+)?)?\s*$/);
+          if (m) {
+            length_m = m[1] ? Number(m[1]) : null;
+            draft_m = m[2] ? Number(m[2]) : null;
+          }
+        }
+
+        // Arrival normalization
+        const arrivalRaw = (row["arrival"] as string) || null;
+        const { iso: arrival_iso, ts: arrival_ts } = parsePtBrDate(arrivalRaw);
+
+        // Notice translation
+        const notice_code = (row["notice"] as string) || null;
+        const notice_en = translateNotice(notice_code);
+
+        // IMO (if page provides as a column or embedded anywhere in row)
+        let imo: string | null = null;
+        if (row["imo"]) {
+          const m = String(row["imo"]).match(/\b\d{7}\b/);
+          if (m) imo = m[0];
+        } else {
+          // scan across cells for a 7-digit IMO-like number
+          for (const v of cells) {
+            const m = v.match(/\b\d{7}\b/);
+            if (m) {
+              imo = m[0];
+              break;
+            }
+          }
+        }
 
         return {
-          eta_text: etaCell,
-          eta_iso: iso,
-          eta_ts: ts,
-          ship,
-          imo: imoMaybe && /^\d{7}$/.test(imoMaybe) ? imoMaybe : undefined,
-          length_m: toNumber(lengthMaybe),
-          draft_m: toNumber(draftMaybe),
-          nav: navMaybe || null,
-          cargo: cargoMaybe || null,
-          priority: priorityMaybe || null,
-          terminal: terminalMaybe || null,
-          raw: tds,
+          imo,
+          ship: (row["ship"] as string) || null,
+          flag: (row["flag"] as string) || null,
+          length_m,
+          draft_m,
+          nav: (row["nav"] as string) || null, // "Cabo", "Long"
+          arrival_text: arrivalRaw,
+          arrival_iso,
+          arrival_ts,
+          notice_code,
+          notice_en,
+          agency: (row["agency"] as string) || null,
+          operation: (row["operation"] as string) || null,
+          goods: (row["goods"] as string) || null,
+          weight: (row["weight"] as string) || null,
+          voyage: (row["voyage"] as string) || null,
+          duv: (row["duv"] as string) || null,
+          priority: (row["priority"] as string) || null,
+          terminal: (row["terminal"] as string) || null,
+          raw: cells,
         };
       });
 
-    // Ordena por ETA real (nulos vão pro final)
-    ships.sort((a, b) => {
-      const at = a.eta_ts ?? Number.POSITIVE_INFINITY;
-      const bt = b.eta_ts ?? Number.POSITIVE_INFINITY;
-      return at - bt;
-    });
+    // sort by real arrival
+    ships.sort((a, b) => (a.arrival_ts ?? Number.POSITIVE_INFINITY) - (b.arrival_ts ?? Number.POSITIVE_INFINITY));
 
     const payload = JSON.stringify({
       source: env.SOURCE_URL,
       updatedAt: new Date().toISOString(),
       count: ships.length,
       ships,
+      headersDetected: headersList, // debug
+      keysDetected: keys,           // debug
     });
 
     const resp = new Response(payload, {
@@ -222,8 +292,7 @@ export default {
         ...corsHeaders(origin),
       },
     });
-
-    ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+    ctx.waitUntil(caches.default.put(cacheKey, resp.clone()));
     return resp;
   },
 };
