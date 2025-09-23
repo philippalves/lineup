@@ -1,0 +1,39 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Wrangler
+        run: npm i -g wrangler@^3
+
+      # Se quiser gravar/atualizar o secret API_KEY no Worker a cada deploy, mantenha este passo.
+      # Caso contrário, defina API_KEY nas "Variables" do Worker no painel e remova este passo.
+      - name: Put API_KEY secret (optional)
+        if: ${{ secrets.API_KEY != '' }}
+        run: echo "${{ secrets.API_KEY }}" | wrangler secret put API_KEY --yes
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Deploy Worker
+        run: wrangler deploy --minify
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
