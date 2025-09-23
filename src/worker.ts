@@ -1,37 +1,36 @@
 export interface Env {
   SOURCE_URL: string;
-  API_KEY?: string;
+  API_KEY?: string; // opcional: se quiser proteger por header x-api-key
 }
 
 type Ship = {
   imo?: string | null;
-  ship?: string | null;         // nome do navio
-  flag?: string | null;
-  length_m?: number | null;
-  draft_m?: number | null;
-  nav?: string | null;          // Cabo / Long
-  arrival_text?: string | null; // "dd/mm/yyyy hh:mm"
-  arrival_iso?: string | null;  // ISO -03:00
-  arrival_ts?: number | null;   // epoch ms (para ordenar)
-  notice_code?: string | null;  // EMB / DESC / EMBDESC
-  notice_en?: string | null;    // Load / Unload / Load & Unload
-  agency?: string | null;
-  operation?: string | null;    // quando existir texto na coluna 5
-  goods?: string | null;
-  weight?: string | null;
-  voyage?: string | null;
-  duv?: string | null;          // número
-  duv_class?: string | null;    // ex.: B
-  pier?: string | null;         // P (ex.: ALAMOA, 35/37…)
-  terminal?: string | null;     // código numérico do terminal
-  raw?: string[];
+  ship?: string | null;        // nome do navio (raw[0])
+  flag?: string | null;        // raw[1]
+  length_m?: number | null;    // derivado de raw[2]
+  draft_m?: number | null;     // derivado de raw[2]
+  nav?: string | null;         // "Cabo"/"Long" -> raw[3]
+  arrival_text?: string | null;// raw[4] ex: "16/09/2025 00:54:00"
+  arrival_iso?: string | null; // ISO -03:00
+  arrival_ts?: number | null;  // epoch ms (ordenável)
+  notice_code?: string | null; // raw[7] EMB / DESC / EMBDESC
+  notice_en?: string | null;   // Load / Unload / Load & Unload
+  agency?: string | null;      // raw[6]
+  operation?: string | null;   // heurística em raw[5] (se não for só número)
+  goods?: string | null;       // raw[8]
+  weight?: string | null;      // raw[9]
+  voyage?: string | null;      // raw[10]
+  duv?: string | null;         // raw[11] (número)
+  duv_class?: string | null;   // raw[12] ex.: "B"
+  pier?: string | null;        // raw[13] (P: "ALAMOA", "35/37", ...)
+  terminal?: string | null;    // raw[14] (código numérico)
+  raw?: string[];              // linha original
 };
 
-// CORS
 const ALLOW = ["https://seachiosbrazil.com","https://www.seachiosbrazil.com"];
 function cors(origin: string | null) {
   return {
-    "Access-Control-Allow-Origin": origin && (ALLOW.includes(origin) || origin.endsWith(".framer.app")) ? origin : "*",
+    "Access-Control-Allow-Origin": origin && (ALLOW.includes(origin) || origin.endsWith(".seachiosbrazil.com")) ? origin : "*",
     "Access-Control-Allow-Methods": "GET,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, x-api-key",
     "Access-Control-Max-Age": "86400",
@@ -46,16 +45,14 @@ function parsePt(
 ): { iso: string | null; ts: number | null } {
   if (!text) return { iso: null, ts: null };
   const t = text.normalize("NFKC").trim();
-  const m = t.match(
-    /(?<d>\d{1,2})\/(?<mo>\d{1,2})(?:\/(?<y>\d{2,4}))?(?:\s+(?<h>\d{1,2})(?::(?<mi>\d{1,2}))?)?/i
-  );
+  const m = t.match(/(?<d>\d{1,2})\/(?<mo>\d{1,2})(?:\/(?<y>\d{2,4}))?(?:\s+(?<h>\d{1,2})(?::(?<mi>\d{1,2}))?)?/i);
   if (!m?.groups) return { iso: null, ts: null };
   let y = m.groups.y ? Number(m.groups.y) : now.getFullYear();
   if (y < 100) y += 2000;
   const d = Number(m.groups.d), mo = Number(m.groups.mo);
   const h = m.groups.h ? Number(m.groups.h) : 0;
   const mi = m.groups.mi ? Number(m.groups.mi) : 0;
-  const utc = Date.UTC(y, mo - 1, d, h, mi, 0) - tzOffsetMin * 60 * 1000;
+  const utc = Date.UTC(y, mo - 1, d, h, mi, 0) - tzOffsetMin * 60 * 1000; // ts em UTC
   const ts = utc;
   const pad = (n: number, w = 2) => String(n).padStart(w, "0");
   const lt = ts + tzOffsetMin * 60 * 1000;
@@ -76,8 +73,7 @@ function translateNotice(code?: string | null) {
   return code;
 }
 
-// tenta decodificar "Length/Draft"
-// formatos esperados: "183 10.5" | "183/10.5" | "18310.5"
+// "183 10.5" | "183/10.5" | "18310.5"
 function parseLenDraft(s?: string | null): { length: number | null; draft: number | null } {
   if (!s) return { length: null, draft: null };
   const t = s.replace(",", ".").trim();
@@ -99,7 +95,7 @@ export default {
       });
     }
 
-    // cache
+    // cache CDN
     const cache = caches.default;
     const key = new Request(new URL(req.url).toString(), req);
     const hit = await cache.match(key);
@@ -112,7 +108,7 @@ export default {
       });
     }
 
-    // Captura a TABELA PRINCIPAL (tbody tds) como linhas cruas
+    // Lê TODAS as linhas de TODAS as tabelas e depois filtramos por "linhas boas"
     const rows: string[][] = [];
     let cur: string[] | null = null, col = -1;
 
@@ -125,17 +121,16 @@ export default {
 
     await rw.transform(up).arrayBuffer();
 
-    // Heurística: consideramos “linha válida” se tiver pelo menos 12-13 colunas
+    // Heurística: mantemos só linhas com "muitas" colunas não vazias (>= 12)
     const good = rows.filter(r => r.filter(v => v?.trim()).length >= 12);
 
     const ships: Ship[] = good.map((cells) => {
-      // índice fixo baseado no seu exemplo de raw[]
       const shipName   = cells[0] ?? "";
       const flag       = cells[1] ?? "";
       const lenDraft   = cells[2] ?? "";
       const nav        = cells[3] ?? "";
       const arrival    = cells[4] ?? "";
-      const col5       = cells[5] ?? ""; // às vezes vem algo; se for texto "grande", tratamos como operação
+      const col5       = cells[5] ?? ""; // pode ser código; só vira "operation" se tiver letras
       const agency     = cells[6] ?? "";
       const notice     = cells[7] ?? "";
       const goods      = cells[8] ?? "";
@@ -148,11 +143,8 @@ export default {
 
       const { length, draft } = parseLenDraft(lenDraft);
       const { iso, ts } = parsePt(arrival);
-
-      // Operation: só aceita se não for apenas números/hífens
       const operation = /[A-Za-z]/.test(col5) && !/^\d[\d\- ]*$/.test(col5) ? col5 : null;
 
-      // IMO: procura qualquer 7 dígitos na linha
       const imoMatch = cells.join(" ").match(/\b\d{7}\b/);
       const imo = imoMatch ? imoMatch[0] : null;
 
@@ -178,8 +170,7 @@ export default {
         pier: pier || null,
         terminal: terminal || null,
         raw: cells,
-        // alias para retrocompatibilidade (se algum front esperar eta_*)
-        // remove se não precisar:
+        // aliases de compatibilidade (remova se não precisar)
         // @ts-ignore
         eta_text: arrival || null,
         // @ts-ignore
@@ -207,4 +198,3 @@ export default {
     return resp;
   },
 };
-
