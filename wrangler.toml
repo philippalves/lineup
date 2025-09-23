@@ -1,0 +1,8 @@
+name = "porto-santos-lineup"
+main = "src/worker.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+SOURCE_URL = "https://www.portodesantos.com.br/informacoes-operacionais/operacoes-portuarias/navegacao-e-movimento-de-navios/navios-esperados-carga/"
+
+# Não coloque secrets aqui. A API_KEY vai como secret (Cloudflare ou Action).
