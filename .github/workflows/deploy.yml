@@ -9,7 +9,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # Secrets do repositório → viram variáveis de ambiente do job
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN:  ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -26,17 +25,12 @@ jobs:
       - name: Install Wrangler
         run: npm i -g wrangler@^3
 
-      # Passo de diagnóstico (não imprime os valores, só checa presença/tamanho)
+      # Passo opcional só pra validar que os secrets chegaram (não imprime valores)
       - name: Validate secrets presence
         run: |
           test -n "$CLOUDFLARE_ACCOUNT_ID" || (echo "Missing CLOUDFLARE_ACCOUNT_ID" && exit 1)
           test -n "$CLOUDFLARE_API_TOKEN"  || (echo "Missing CLOUDFLARE_API_TOKEN" && exit 1)
-          echo "CLOUDFLARE_ACCOUNT_ID length: ${#CLOUDFLARE_ACCOUNT_ID}"
-          echo "CLOUDFLARE_API_TOKEN length: ${#CLOUDFLARE_API_TOKEN}"
-
-      # Opcional: confirma autenticação na conta (não revela nada sensível)
-      - name: Wrangler whoami
-        run: wrangler whoami
+          echo "OK: secrets presentes"
 
       - name: Deploy Worker
         run: wrangler deploy --minify
