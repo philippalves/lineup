@@ -39,7 +39,7 @@ const fetcher = (url: string, apiKey?: string) =>
 
 export default function PortoSantosExpectedCargo(props: Partial<Props>) {
   const {
-    apiUrl = "https://SEU-ENDPOINT.workers.dev",
+    apiUrl = "https://porto-santos-lineup.filippe.workers.dev",
     apiKey,
     refreshMs = 60_000,
     maxRows = 50,
