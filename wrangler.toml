@@ -1,8 +1,17 @@
-name = "porto-santos-lineup"
-main = "src/worker.ts"
-compatibility_date = "2024-12-01"
+# wrangler.toml
+name = "porto-santos-lineup"         # mantém a mesma URL: porto-santos-lineup.<subdomínio>.workers.dev
+main = "src/worker.ts"               # caminho do arquivo TS
+compatibility_date = "2024-09-23"    # qualquer data recente compatível
+workers_dev = true                   # publica em workers.dev
 
-[vars]
-SOURCE_URL = "https://www.portodesantos.com.br/informacoes-operacionais/operacoes-portuarias/navegacao-e-movimento-de-navios/navios-esperados-carga/"
+# Se quiser usar APIs Node (não estamos usando, mas pode deixar):
+compatibility_flags = ["nodejs_compat"]
 
-# Não coloque secrets aqui. A API_KEY vai como secret (Cloudflare ou Action).
+# Observabilidade opcional no painel
+[observability]
+enabled = true
+
+# ⚠️ Não declare 'account_id' aqui; o GitHub Actions já injeta via env CLOUDFLARE_ACCOUNT_ID.
+# ⚠️ Não declare 'API_KEY' aqui (é segredo). Se quiser ativar, defina como secret no Worker:
+#     wrangler secret put API_KEY
+# ou pelo dashboard (Settings -> Variables -> Add secret).
